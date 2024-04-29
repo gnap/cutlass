@@ -101,12 +101,16 @@ using EpilogueOutputOp = cutlass::epilogue::thread::LinearCombinationGenericWith
     128 / cutlass::sizeof_bits<ElementOutput>::value,
     ElementAccumulator,
     ElementAccumulator>;
-*/
 using EpilogueOutputOp = cutlass::epilogue::thread::LinearCombinationGeneric<
     cutlass::epilogue::thread::ReLu,
     ElementOutput,
     128 / cutlass::sizeof_bits<ElementOutput>::value,
     ElementAccumulator>;
+*/
+using EpilogueOutputOp = typename cutlass::gemm::device::DefaultGemmConfiguration<
+    cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80, ElementA, ElementB, ElementOutput,
+    ElementAccumulator>::EpilogueOutputOp;
+
 template <typename MathOperator>
 using Gemm_ = cutlass::gemm::device::GemmUniversal<
     ElementA, LayoutA, ElementB, LayoutB, ElementOutput, LayoutC,
