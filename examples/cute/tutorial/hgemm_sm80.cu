@@ -42,14 +42,14 @@
 #include "cutlass/util/print_error.hpp"
 
 template <class ProblemShape, class CtaTiler,
-          class TA, class AStride, class ASmemLayout, class TiledCopyA,
-          class TB, class BStride, class BSmemLayout, class TiledCopyB,
-          class TC, class CStride, class CSmemLayout, class TiledMma,
-          class SmemCopyAtom, class Alpha, class Beta>
+          class TA, class AStride, class ASmemLayout, class TiledCopyA, class SmemCopyAtomA,
+          class TB, class BStride, class BSmemLayout, class TiledCopyB, class SmemCopyAtomB,
+          class TC, class CStride, class CSmemLayout, class TiledCopyC, class SmemCopyAtomC,
+          class TiledMma, class Alpha, class Beta>
 __global__ static __launch_bounds__(decltype(size(TiledMma{}))::value) void gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
-                                                                                        TA const *A, AStride dA, ASmemLayout sA_layout, TiledCopyA copy_a,
-                                                                                        TB const *B, BStride dB, BSmemLayout sB_layout, TiledCopyB copy_b,
-                                                                                        TC *C, CStride dC, CSmemLayout, TiledMma mma, SmemCopyAtom smem_copy_atom,
+                                                                                        TA const *A, AStride dA, ASmemLayout sA_layout, TiledCopyA copy_a, SmemCopyAtomA smem_copy_atom_a,
+                                                                                        TB const *B, BStride dB, BSmemLayout sB_layout, TiledCopyB copy_b, SmemCopyAtomB smem_copy_atom_b,
+                                                                                        TC *C, CStride dC, CSmemLayout sC_layout, TiledCopyC copy_c, SmemCopyAtomC smem_copy_atom_c, TiledMma mma,
                                                                                         Alpha alpha, Beta beta) {
     using namespace cute;
 
@@ -65,9 +65,9 @@ __global__ static __launch_bounds__(decltype(size(TiledMma{}))::value) void gemm
     static_assert(is_static<CSmemLayout>::value);
 
     CUTE_STATIC_ASSERT_V(size<0>(ASmemLayout{}) == size<0>(cta_tiler)); // BLK_M
-    CUTE_STATIC_ASSERT_V(size<1>(CSmemLayout{}) == size<0>(cta_tiler)); // BLK_M
+    // CUTE_STATIC_ASSERT_V(size<1>(CSmemLayout{}) == size<0>(cta_tiler)); // BLK_M
     CUTE_STATIC_ASSERT_V(size<0>(BSmemLayout{}) == size<1>(cta_tiler)); // BLK_N
-    CUTE_STATIC_ASSERT_V(size<1>(CSmemLayout{}) == size<1>(cta_tiler)); // BLK_N
+    // CUTE_STATIC_ASSERT_V(size<1>(CSmemLayout{}) == size<1>(cta_tiler)); // BLK_N
     CUTE_STATIC_ASSERT_V(size<1>(ASmemLayout{}) == size<2>(cta_tiler)); // BLK_K
     CUTE_STATIC_ASSERT_V(size<1>(BSmemLayout{}) == size<2>(cta_tiler)); // BLK_K
 
@@ -99,9 +99,9 @@ __global__ static __launch_bounds__(decltype(size(TiledMma{}))::value) void gemm
     //
     // Partition the copying of A and B tiles across the threads
     //
+    auto s2r_tiled_copy_a = make_tiled_copy_A(SmemCopyAtomA{}, mma);
+    auto s2r_thr_copy_a = s2r_tiled_copy_a.get_slice(threadIdx.x);
     /*
-    auto s2r_tiled_copy_a = make_tiled_copy_A(SmemCopyAtom{}, tiled_mma);
-    auto s2r_thr_copy_a = s2r_tiled_copy_a.get_slice(idx);
     auto tAsA = s2r_thr_copy_a.partition_S(sA); // ? (CPY, CPY_M, CPY_K, kStage)
     */
     ThrCopy thr_copy_a = copy_a.get_slice(threadIdx.x);
@@ -283,6 +283,48 @@ __global__ static __launch_bounds__(decltype(size(TiledMma{}))::value) void gemm
     //
 
     // axpby(alpha, tCrC, beta, tCgC);
+    // use less shared memory as a scratchpad tile to use large wide instuction
+    // Dreg -> shm -> reg -> global
+    axpby(alpha, tCrC, beta, tCrC);
+    auto sC = make_tensor(sA(_, _, smem_pipe_read).data(), CSmemLayout{});
+
+    auto r2s_tiled_copy_c = make_tiled_copy_C(SmemCopyAtomC{}, mma);
+    auto r2s_thr_copy_c = r2s_tiled_copy_c.get_slice(threadIdx.x);
+    auto tCrC_r2s = r2s_thr_copy_c.retile_S(tCrC);  // (CPY, CPY_M, CPY_N)
+    auto tCsC_r2s = r2s_thr_copy_c.partition_D(sC); // (CPY, _1, _1, pipe)
+
+    TiledCopyC s2g_tiled_copy_c;
+    auto s2g_thr_copy_c = s2g_tiled_copy_c.get_thread_slice(threadIdx.x);
+    auto tCsC_s2g = s2g_thr_copy_c.partition_S(sC); // (CPY, _1, _1, pipe)
+    auto tCgC_s2g = s2g_thr_copy_c.partition_D(gC); // (CPY, CPY_M, CPY_N)
+
+    auto tCgC_s2gx = group_modes<1, 3>(tCgC_s2g); // (CPY_, CPY_MN)
+    auto tCrC_r2sx = group_modes<1, 3>(tCrC_r2s); // (CPY_, CPY_MN)
+
+    int step = size<3>(tCsC_r2s); // pipe
+    CUTE_UNROLL
+    for (int i = 0; i < size<1>(tCrC_r2sx); i += step) {
+        // reg -> shm
+        CUTE_UNROLL
+        for (int j = 0; j < step; ++j) {
+            // we add a temp tensor to cope with accumulator and output data type
+            // difference
+            auto t = make_tensor_like<TC>(tCrC_r2sx(_, i + j));
+            cute::copy(tCrC_r2sx(_, i + j), t);
+
+            cute::copy(r2s_tiled_copy_c, t, tCsC_r2s(_, 0, 0, j));
+        }
+        __syncthreads();
+
+        CUTE_UNROLL
+        // shm -> global
+        for (int j = 0; j < step; ++j) {
+            // cute::copy(s2g_tiled_copy_c, tCsC_s2g(_, 0, 0, j), tCgC_s2gx(_, i + j));
+            cute::copy(tCsC_s2g(_, 0, 0, j), tCgC_s2gx(_, i + j));
+        }
+
+        __syncthreads();
+    }
 }
 
 // Setup params for a NT GEMM
@@ -399,7 +441,14 @@ void gemm_tn(int m, int n, int k,
                     make_stride(Int<32>{}, Int<1>{})));
     auto sA = tile_to_shape(SmemLayoutAtom, make_shape(bM, bK, bP));
     auto sB = tile_to_shape(SmemLayoutAtom, make_shape(bN, bK, bP));
-    auto sC = make_layout(make_shape(bM, bN)); // (m,n) -> smem_idx
+
+    using SmemLayoutAtomC = decltype(composition(
+        Swizzle<2, 3, 3>{}, make_layout(make_shape(Int<32>{}, Int<32>{}),
+                                        make_stride(Int<32>{}, Int<1>{}))));
+    auto sC = tile_to_shape(
+        SmemLayoutAtomC{},
+        make_shape(Int<32>{}, Int<32>{}, Int<2>{}));
+    // auto sC = make_layout(make_shape(bM, bN)); // (m,n) -> smem_idx
 
     // Define the thread layouts (static)
 
@@ -415,15 +464,30 @@ void gemm_tn(int m, int n, int k,
                                      Layout<Shape<_16,_16,_1>>{});  // 16x16x1 TiledMMA
 
     */
-    TiledMMA mmaC = make_tiled_mma(MMA_Atom<SM80_16x8x16_F32F16F16F32_TN>{},
+    TiledMMA mmaC = make_tiled_mma(MMA_Atom<SM80_16x8x16_F16F16F16F16_TN>{},
                                    Layout<Shape<_2, _2, _1>>{},
                                    Layout<Shape<_1, _2, _1>>{}); // 32x32x16 TiledMMA
 
-    auto smem_copy_atom = Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>, TA>{};
-    TiledCopy copyA = make_tiled_copy(smem_copy_atom,
+    auto gmem_copy_atom = Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>, TA>{};
+    TiledCopy copyA = make_tiled_copy(gmem_copy_atom,
                                       Layout<Shape<_32, _4>, Stride<_4, _1>>{}, // Thr layout 16x8 k-major
                                       Layout<Shape<_1, _8>>{});                 // Val layout  1x8
     TiledCopy copyB = copyA;
+
+    auto S2GCopyAtomC = Copy_Atom<UniversalCopy<cute::uint128_t>, TC>{};
+    TiledCopy copyC =
+        make_tiled_copy(S2GCopyAtomC,
+                        make_layout(make_shape(Int<32>{}, Int<4>{}),
+                                    make_stride(Int<4>{}, Int<1>{})),
+                        make_layout(make_shape(Int<1>{}, Int<8>{})));
+    // TiledCopy copyC = copyA;
+
+    using Smem_copy_op = SM75_U32x4_LDSM_N;
+    using Smem_copy_traits = Copy_Traits<Smem_copy_op>;
+    auto smem_copy_atom = Copy_Atom<Smem_copy_traits, TA>{};
+
+    auto smem_copy_atom_c = Copy_Atom<UniversalCopy<int>, TC>{};
+
     /*
     TiledCopy copyB = make_tiled_copy(Copy_Atom<UniversalCopy<uint128_t>, TB>{},
                                       Layout<Shape<_32, _4>, Stride<_4, _1>>{}, // Thr layout 16x8 k-major
@@ -446,9 +510,9 @@ void gemm_tn(int m, int n, int k,
     dim3 dimGrid(size(ceil_div(M, bM)),
                  size(ceil_div(N, bN)));
     gemm_device<<<dimGrid, dimBlock, 0, stream>>>(prob_shape, cta_tiler,
-                                                  A, dA, sA, copyA,
-                                                  B, dB, sB, copyB,
-                                                  C, dC, sC, mmaC, smem_copy_atom,
+                                                  A, dA, sA, copyA, smem_copy_atom,
+                                                  B, dB, sB, copyB, smem_copy_atom,
+                                                  C, dC, sC, copyC, smem_copy_atom_c, mmaC,
                                                   alpha, beta);
 }
 
@@ -505,7 +569,7 @@ int main(int argc, char **argv) {
 
     using TA = cutlass::half_t;
     using TB = cutlass::half_t;
-    using TC = float;
+    using TC = cutlass::half_t;
     using TI = float;
 
     TI alpha = 1.0;
@@ -533,7 +597,7 @@ int main(int argc, char **argv) {
 
     double gflops = (2.0 * m * n * k) * 1e-9;
 
-    const int timing_iterations = 100;
+    const int timing_iterations = 10;
     GPU_Clock timer;
 
     int ldA = 0, ldB = 0, ldC = m;
@@ -556,14 +620,18 @@ int main(int argc, char **argv) {
 
     // Run once
     d_C = h_C;
-    gemm(transA, transB, m, n, k,
-         alpha,
-         d_A.data().get(), ldA,
-         d_B.data().get(), ldB,
-         beta,
-         d_C.data().get(), ldC);
+    for (int i = 0; i < 5; ++i) {
+        gemm(transA, transB, m, n, k,
+             alpha,
+             d_A.data().get(), ldA,
+             d_B.data().get(), ldB,
+             beta,
+             d_C.data().get(), ldC);
+    }
     CUTE_CHECK_LAST();
     thrust::host_vector<TC> cute_result = d_C;
+
+    cudaDeviceSynchronize();
 
     // Timing iterations
     timer.start();
@@ -575,7 +643,7 @@ int main(int argc, char **argv) {
              beta,
              d_C.data().get(), ldC);
     }
-    double cute_time = timer.seconds() / timing_iterations;
+    double cute_time = timer.seconds() / float(timing_iterations);
     CUTE_CHECK_LAST();
     printf("CUTE_GEMM:     [%6.1f]GFlop/s  (%6.4f)ms\n", gflops / cute_time, cute_time * 1000);
 
