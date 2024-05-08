@@ -526,33 +526,38 @@ struct TestbedRunner {
         cutlass::maximum_with_nan_propogation<ElementCompute> max;
         cutlass::epilogue::thread::ReLu<ElementCompute> act;
 
+        // ElementScalingFactor d_scale = kScaleOutput ? scale_D.host_view().at(origin) : ElementScalingFactor(1.);
+
+        for (int m = 0; m < options.problem_size.m(); ++m) {
+            for (int n = 0; n < options.problem_size.n(); ++n) {
+                ElementCompute intermediate = cvt_accum_to_compute(tmp_D.host_view().at({m, n}));
+                /*
+                ElementCompute bias = cvt_c_to_compute(tensor_Vector.host_view().at({0, n}));
+                ElementCompute aux = intermediate + bias;
+                ElementCompute d = act(aux);
+                // tmp_abs_max_Aux = max(abs(aux), tmp_abs_max_Aux);
+                tmp_abs_max_D = max(abs(d), tmp_abs_max_D);
+                reference_D.host_view().at({m, n}) = cvt_compute_to_d(d * d_scale);
+                */
+                reference_D.host_view().at({m, n}) = cvt_compute_to_d(intermediate);
+
+                /*
+                                if (kScaleAux) {
+                                    reference_Aux.host_view().at({m, n}) = cvt_compute_to_aux(aux * scale_Aux.host_view().at(origin));
+                                }
+        */
+            }
+        }
+
         /*
-ElementScalingFactor d_scale = kScaleOutput ? scale_D.host_view().at(origin) : ElementScalingFactor(1.);
-
-for (int m = 0; m < options.problem_size.m(); ++m) {
-    for (int n = 0; n < options.problem_size.n(); ++n) {
-        ElementCompute intermediate = cvt_accum_to_compute(tmp_D.host_view().at({m, n}));
-        ElementCompute bias = cvt_c_to_compute(tensor_Vector.host_view().at({0, n}));
-        ElementCompute aux = intermediate + bias;
-        ElementCompute d = act(aux);
-        // tmp_abs_max_Aux = max(abs(aux), tmp_abs_max_Aux);
-        tmp_abs_max_D = max(abs(d), tmp_abs_max_D);
-        reference_D.host_view().at({m, n}) = cvt_compute_to_d(d * d_scale);
-
-                        if (kScaleAux) {
-                            reference_Aux.host_view().at({m, n}) = cvt_compute_to_aux(aux * scale_Aux.host_view().at(origin));
-                        }
-    }
-}
-
         if (kScaleAux) {
             reference_abs_max_Aux.host_view().at(origin) = cvt_compute_to_accum(tmp_abs_max_Aux);
         }
 
-if (kScaleOutput) {
-    reference_abs_max_D.host_view().at(origin) = cvt_compute_to_accum(tmp_abs_max_D);
-}
-*/
+        if (kScaleOutput) {
+        reference_abs_max_D.host_view().at(origin) = cvt_compute_to_accum(tmp_abs_max_D);
+        }
+        */
 
         return compare_reference(options);
     }
