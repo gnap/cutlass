@@ -58,8 +58,14 @@ __global__ static __launch_bounds__(decltype(size(TiledMma{}))::value) void gemm
     Tensor gC = local_tile(mC, cta_tiler, cta_coord, Step<_1, _1, X>{}); // (BLK_M,BLK_N)
 
     // Shared memory buffers
+    extern __shared__ Element smem_[];
+    Element *smemA = smem_;
+    Element *smemB = smem_ + cosize_v<ASmemLayout>;
+    /*
     __shared__ Element smemA[cosize_v<ASmemLayout>];
     __shared__ Element smemB[cosize_v<BSmemLayout>];
+    */
+
     Tensor sA = make_tensor(make_smem_ptr(smemA), sA_layout); // (BLK_M,BLK_K,PIPE)
     Tensor sB = make_tensor(make_smem_ptr(smemB), sB_layout); // (BLK_N,BLK_K,PIPE)
 
@@ -317,7 +323,6 @@ void gemm_tn(int m, int n, int k,
     // Define TN strides (mixed)
     auto dA = make_stride(ldA, Int<1>{}); // (dM, dK)
     auto dB = make_stride(ldB, Int<1>{}); // (dN, dK)
-    // auto dC = make_stride(Int<1>{}, ldC); // (dM, dN)
     auto dC = make_stride(ldC, Int<1>{}); // (dM, dN)
 
     // Define CTA tile sizes (static)
@@ -378,15 +383,29 @@ void gemm_tn(int m, int n, int k,
   print_latex(copyB);
   print_latex(mmaC);
 #endif
+    static constexpr int shm_size_AB =
+        (cute::cosize(sA) + cute::cosize(sB)) * sizeof(Element);
+    static constexpr int shm_size_C = cute::cosize(sC) * sizeof(TC);
+
+    static constexpr int shm_size =
+        cute::max(shm_size_AB, shm_size_C);
+
+    cudaFuncSetAttribute(gemm_device<decltype(prob_shape), decltype(cta_tiler), Element,
+                                     decltype(dA), decltype(sA), decltype(copyA), decltype(smem_copy_atom),
+                                     decltype(dB), decltype(sB), decltype(copyB), decltype(smem_copy_atom),
+                                     TC,
+                                     decltype(dC), decltype(sC), copyC, decltype(smem_copy_atom_c),
+                                     decltype(mmaC), float, float>,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
 
     dim3 dimBlock(size(mmaC));
     dim3 dimGrid(size(ceil_div(M, bM)),
                  size(ceil_div(N, bN)));
-    gemm_device<<<dimGrid, dimBlock, 0, stream>>>(prob_shape, cta_tiler,
-                                                  A, dA, sA, copyA, smem_copy_atom,
-                                                  B, dB, sB, copyB, smem_copy_atom,
-                                                  C, dC, sC, copyC{}, smem_copy_atom_c, mmaC,
-                                                  alpha, beta);
+    gemm_device<<<dimGrid, dimBlock, shm_size, stream>>>(prob_shape, cta_tiler,
+                                                         A, dA, sA, copyA, smem_copy_atom,
+                                                         B, dB, sB, copyB, smem_copy_atom,
+                                                         C, dC, sC, copyC{}, smem_copy_atom_c, mmaC,
+                                                         alpha, beta);
 }
 
 template <class Element, class TC,
