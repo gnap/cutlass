@@ -285,8 +285,8 @@ __global__ static __launch_bounds__(decltype(size(TiledMma{}))::value) void gemm
     //
 
     // axpby(alpha, tCrC, beta, tCgC);
-    // use less shared memory as a scratchpad tile to use large wide instuction
-    // Dreg -> shm -> reg -> global
+    //  use less shared memory as a scratchpad tile to use large wide instuction
+    //  Dreg -> shm -> reg -> global
     axpby(alpha, tCrC, beta, tCrC);
     auto sC = make_tensor(sA(_, _, smem_pipe_read).data(), CSmemLayout{});
 
@@ -305,13 +305,8 @@ __global__ static __launch_bounds__(decltype(size(TiledMma{}))::value) void gemm
 
 #if 0
     if (thread0()) {
-        print(s2g_tiled_copy_c);
-        print("\n");
-        print(mA.layout());
-        print("\n");
-        print(mB.layout());
-        print("\n");
-        print(mC.layout());
+        print(tCrC_r2s);
+        print(tCsC_r2s);
         print("\n");
     }
 #endif
@@ -482,7 +477,8 @@ void gemm_tn(int m, int n, int k,
     */
     TiledMMA mmaC = make_tiled_mma(MMA_Atom<SM80_16x8x16_F16F16F16F16_TN>{},
                                    Layout<Shape<_2, _2, _1>>{},
-                                   Layout<Shape<_1, _2, _1>>{}); // 32x32x16 TiledMMA
+                                   Tile<_32, _32, _16>{}); // 32x32x16 TiledMMA
+                                                           // Layout<Shape<_1, _2, _1>>{}); // 32x32x16 TiledMMA
 
     auto gmem_copy_atom = Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>, TA>{};
     TiledCopy copyA = make_tiled_copy(gmem_copy_atom,
@@ -619,7 +615,7 @@ int main(int argc, char **argv) {
 
     double gflops = (2.0 * m * n * k) * 1e-9;
 
-    const int timing_iterations = 20;
+    const int timing_iterations = 1;
     GPU_Clock timer;
 
     int ldA = 0, ldB = 0, ldC = m;
