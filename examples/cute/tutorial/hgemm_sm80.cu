@@ -41,6 +41,8 @@
 #include "cutlass/util/helper_cuda.hpp"
 #include "cutlass/util/print_error.hpp"
 
+#include "cublaslt-gemm.h"
+
 template <class ProblemShape, class CtaTiler,
           class TA, class AStride, class ASmemLayout, class TiledCopyA, class SmemCopyAtomA,
           class TB, class BStride, class BSmemLayout, class TiledCopyB, class SmemCopyAtomB,
@@ -301,6 +303,18 @@ __global__ static __launch_bounds__(decltype(size(TiledMma{}))::value) void gemm
     auto tCgC_s2gx = group_modes<1, 3>(tCgC_s2g); // (CPY_, CPY_MN)
     auto tCrC_r2sx = group_modes<1, 3>(tCrC_r2s); // (CPY_, CPY_MN)
 
+#if 0
+    if (thread0()) {
+        print(s2g_tiled_copy_c);
+        print("\n");
+        print(mA.layout());
+        print("\n");
+        print(mB.layout());
+        print("\n");
+        print(mC.layout());
+        print("\n");
+    }
+#endif
     int step = size<3>(tCsC_r2s); // pipe
     CUTE_UNROLL
     for (int i = 0; i < size<1>(tCrC_r2sx); i += step) {
@@ -319,8 +333,9 @@ __global__ static __launch_bounds__(decltype(size(TiledMma{}))::value) void gemm
         CUTE_UNROLL
         // shm -> global
         for (int j = 0; j < step; ++j) {
-            // cute::copy(s2g_tiled_copy_c, tCsC_s2g(_, 0, 0, j), tCgC_s2gx(_, i + j));
-            cute::copy(tCsC_s2g(_, 0, 0, j), tCgC_s2gx(_, i + j));
+
+            cute::copy(s2g_tiled_copy_c, tCsC_s2g(_, 0, 0, j), tCgC_s2gx(_, i + j));
+            // cute::copy(tCsC_s2g(_, 0, 0, j), tCgC_s2gx(_, i + j));
         }
 
         __syncthreads();
@@ -419,7 +434,8 @@ void gemm_tn(int m, int n, int k,
     // Define TN strides (mixed)
     auto dA = make_stride(ldA, Int<1>{}); // (dM, dK)
     auto dB = make_stride(ldB, Int<1>{}); // (dN, dK)
-    auto dC = make_stride(Int<1>{}, ldC); // (dM, dN)
+    // auto dC = make_stride(Int<1>{}, ldC); // (dM, dN)
+    auto dC = make_stride(ldC, Int<1>{}); // (dM, dN)
 
     // Define CTA tile sizes (static)
     auto bM = Int<128>{};
@@ -474,12 +490,12 @@ void gemm_tn(int m, int n, int k,
                                       Layout<Shape<_1, _8>>{});                 // Val layout  1x8
     TiledCopy copyB = copyA;
 
-    auto S2GCopyAtomC = Copy_Atom<UniversalCopy<cute::uint128_t>, TC>{};
-    TiledCopy copyC =
-        make_tiled_copy(S2GCopyAtomC,
-                        make_layout(make_shape(Int<32>{}, Int<4>{}),
-                                    make_stride(Int<4>{}, Int<1>{})),
-                        make_layout(make_shape(Int<1>{}, Int<8>{})));
+    using S2GCopyAtomC = Copy_Atom<UniversalCopy<cute::uint128_t>, TC>;
+    using copyC =
+        decltype(make_tiled_copy(S2GCopyAtomC{},
+                                 make_layout(make_shape(Int<32>{}, Int<4>{}),
+                                             make_stride(Int<4>{}, Int<1>{})),
+                                 make_layout(make_shape(Int<1>{}, Int<8>{}))));
     // TiledCopy copyC = copyA;
 
     using Smem_copy_op = SM75_U32x4_LDSM_N;
@@ -512,7 +528,7 @@ void gemm_tn(int m, int n, int k,
     gemm_device<<<dimGrid, dimBlock, 0, stream>>>(prob_shape, cta_tiler,
                                                   A, dA, sA, copyA, smem_copy_atom,
                                                   B, dB, sB, copyB, smem_copy_atom,
-                                                  C, dC, sC, copyC, smem_copy_atom_c, mmaC,
+                                                  C, dC, sC, copyC{}, smem_copy_atom_c, mmaC,
                                                   alpha, beta);
 }
 
@@ -567,9 +583,9 @@ int main(int argc, char **argv) {
     if (argc >= 6)
         sscanf(argv[5], "%c", &transB);
 
-    using TA = cutlass::half_t;
-    using TB = cutlass::half_t;
-    using TC = cutlass::half_t;
+    using TA = cute::half_t;
+    using TB = cute::half_t;
+    using TC = cute::half_t;
     using TI = float;
 
     TI alpha = 1.0;
@@ -583,6 +599,7 @@ int main(int argc, char **argv) {
     thrust::host_vector<TA> h_A(m * k);
     thrust::host_vector<TB> h_B(n * k);
     thrust::host_vector<TC> h_C(m * n);
+    thrust::host_vector<TC> h_Cblas(m * n);
 
     for (int j = 0; j < m * k; ++j)
         h_A[j] = static_cast<TA>(2 * (rand() / double(RAND_MAX)) - 1);
@@ -591,13 +608,18 @@ int main(int argc, char **argv) {
     for (int j = 0; j < m * n; ++j)
         h_C[j] = static_cast<TC>(-1);
 
+    for (int j = 0; j < m * n; ++j)
+        h_Cblas[j] = static_cast<TC>(-1);
+
     thrust::device_vector<TA> d_A = h_A;
     thrust::device_vector<TB> d_B = h_B;
+    thrust::device_vector<TC> d_Cblas = h_Cblas;
     thrust::device_vector<TC> d_C = h_C;
+    CUTE_CHECK_LAST();
 
     double gflops = (2.0 * m * n * k) * 1e-9;
 
-    const int timing_iterations = 10;
+    const int timing_iterations = 20;
     GPU_Clock timer;
 
     int ldA = 0, ldB = 0, ldC = m;
@@ -620,7 +642,7 @@ int main(int argc, char **argv) {
 
     // Run once
     d_C = h_C;
-    for (int i = 0; i < 5; ++i) {
+    for (int i = 0; i < 1; ++i) {
         gemm(transA, transB, m, n, k,
              alpha,
              d_A.data().get(), ldA,
@@ -631,21 +653,39 @@ int main(int argc, char **argv) {
     CUTE_CHECK_LAST();
     thrust::host_vector<TC> cute_result = d_C;
 
+    CublasLtGemm<TA, TC> cublaslt_gemm;
+    cublaslt_gemm.init(d_Cblas.data().get(), d_B.data().get(), d_A.data().get(), n, m, k);
+    cublaslt_gemm.run();
+    thrust::host_vector<TC> cublas_result = d_Cblas;
     cudaDeviceSynchronize();
 
-    // Timing iterations
-    timer.start();
+    const auto cute_result_ptr = cute_result.data();
+    auto cublas_result_ptr = cublas_result.data();
+    auto tD_host = cute::make_tensor(cute_result_ptr, cute::make_shape(m, n), cute::make_stride(n, 1));
+    auto tD_host_cublaslt =
+        cute::make_tensor(cublas_result_ptr, cute::make_shape(m, n), cute::make_stride(n, 1));
+
+    auto tile = cute::make_tile(min(8, m), min(8, n));
+    auto t32x32 = cute::local_tile(tD_host, tile, cute::make_coord(0, 0));
+    auto t32x32_cublaslt = cute::local_tile(tD_host_cublaslt, tile, cute::make_coord(0, 0));
+
+    print_tensor(t32x32);
+    print_tensor(t32x32_cublaslt);
+
     for (int i = 0; i < timing_iterations; ++i) {
+
+        // Timing iterations
+        timer.start();
         gemm(transA, transB, m, n, k,
              alpha,
              d_A.data().get(), ldA,
              d_B.data().get(), ldB,
              beta,
              d_C.data().get(), ldC);
+        double cute_time = timer.milliseconds() / float(1);
+        CUTE_CHECK_LAST();
+        printf("CUTE_GEMM:     [%6.1f]GFlop/s  (%6.4f)ms\n", gflops / cute_time * 1e3, cute_time);
     }
-    double cute_time = timer.seconds() / float(timing_iterations);
-    CUTE_CHECK_LAST();
-    printf("CUTE_GEMM:     [%6.1f]GFlop/s  (%6.4f)ms\n", gflops / cute_time, cute_time * 1000);
 
     return 0;
 }
