@@ -246,7 +246,7 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
   */
 
   TiledCopy copyC = make_tiled_copy_C(Copy_Atom<DefaultCopy, TC>{}, mma);
-  //copy(copyC, tCrC, tCgC);
+  copy(copyC, tCrC, tCgC);
 }
 
 // Setup params for a NT GEMM
@@ -313,9 +313,8 @@ gemm_nt(int m, int n, int k,
   //TiledMMA mmaC = make_tiled_mma(UniversalFMA<TC,TA,TB>{},
   //                               Layout<Shape<_32,_16,_1>>{});  // 16x16x1 UniversalFMA
   TiledMMA mmaC = make_tiled_mma(MMA_Atom<SM80_16x8x16_F32F16F16F32_TN>{},
-                                 Layout<Shape<_2,_2,_1>>{},
-                                 Layout<Shape<_1, _2, _1>>{});  // 16x16x1 TiledMMA
-
+                                 Layout<Shape<_2, _2, _1>>{},
+                                 Tile<_32, _32, _16>{}); // 16x16x1 TiledMMA
 
 #if 0
   print(copyA);
