@@ -1,33 +1,3 @@
-/***************************************************************************************************
- * Copyright (c) 2023 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: BSD-3-Clause
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- * 1. Redistributions of source code must retain the above copyright notice, this
- * list of conditions and the following disclaimer.
- *
- * 2. Redistributions in binary form must reproduce the above copyright notice,
- * this list of conditions and the following disclaimer in the documentation
- * and/or other materials provided with the distribution.
- *
- * 3. Neither the name of the copyright holder nor the names of its
- * contributors may be used to endorse or promote products derived from
- * this software without specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
- * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
- * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
- * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
- * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *
- **************************************************************************************************/
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
@@ -59,17 +29,12 @@ __global__ static __launch_bounds__(decltype(size(TiledMma{}))::value) void gemm
     CUTE_STATIC_ASSERT_V(rank(shape_MNK) == Int<3>{}); // (M, N, K)
     CUTE_STATIC_ASSERT_V(rank(cta_tiler) == Int<3>{}); // (BLK_M, BLK_N, BLK_K)
 
-    // CUTE_STATIC_ASSERT_V(size(copy_a) == size(mma)); // NumThreads
-    // CUTE_STATIC_ASSERT_V(size(copy_b) == size(mma)); // NumThreads
-
     static_assert(is_static<ASmemLayout>::value);
     static_assert(is_static<BSmemLayout>::value);
     static_assert(is_static<CSmemLayout>::value);
 
     CUTE_STATIC_ASSERT_V(size<0>(ASmemLayout{}) == size<0>(cta_tiler)); // BLK_M
-    // CUTE_STATIC_ASSERT_V(size<1>(CSmemLayout{}) == size<0>(cta_tiler)); // BLK_M
     CUTE_STATIC_ASSERT_V(size<0>(BSmemLayout{}) == size<1>(cta_tiler)); // BLK_N
-    // CUTE_STATIC_ASSERT_V(size<1>(CSmemLayout{}) == size<1>(cta_tiler)); // BLK_N
     CUTE_STATIC_ASSERT_V(size<1>(ASmemLayout{}) == size<2>(cta_tiler)); // BLK_K
     CUTE_STATIC_ASSERT_V(size<1>(BSmemLayout{}) == size<2>(cta_tiler)); // BLK_K
 
@@ -101,11 +66,6 @@ __global__ static __launch_bounds__(decltype(size(TiledMma{}))::value) void gemm
     //
     // Partition the copying of A and B tiles across the threads
     //
-    auto s2r_tiled_copy_a = make_tiled_copy_A(SmemCopyAtomA{}, mma);
-    auto s2r_thr_copy_a = s2r_tiled_copy_a.get_slice(threadIdx.x);
-    /*
-    auto tAsA = s2r_thr_copy_a.partition_S(sA); // ? (CPY, CPY_M, CPY_K, kStage)
-    */
     ThrCopy thr_copy_a = copy_a.get_slice(threadIdx.x);
     Tensor tAgA = thr_copy_a.partition_S(gA); // (CPY,CPY_M,CPY_K,k)
     Tensor tAsA = thr_copy_a.partition_D(sA); // (CPY,CPY_M,CPY_K,PIPE)
@@ -330,85 +290,13 @@ __global__ static __launch_bounds__(decltype(size(TiledMma{}))::value) void gemm
         for (int j = 0; j < step; ++j) {
 
             cute::copy(s2g_tiled_copy_c, tCsC_s2g(_, 0, 0, j), tCgC_s2gx(_, i + j));
-            // cute::copy(tCsC_s2g(_, 0, 0, j), tCgC_s2gx(_, i + j));
         }
 
         __syncthreads();
     }
 }
 
-// Setup params for a NT GEMM
-template <class TA, class TB, class TC,
-          class Alpha, class Beta>
-void gemm_nt(int m, int n, int k,
-             Alpha alpha,
-             TA const *A, int ldA,
-             TB const *B, int ldB,
-             Beta beta,
-             TC *C, int ldC,
-             cudaStream_t stream = 0) {
-    using namespace cute;
-
-    // Define shapes (dynamic)
-    auto M = int(m);
-    auto N = int(n);
-    auto K = int(k);
-    auto prob_shape = make_shape(M, N, K); // (M, N, K)
-
-    // Define NT strides (mixed)
-    auto dA = make_stride(Int<1>{}, ldA); // (dM, dK)
-    auto dB = make_stride(Int<1>{}, ldB); // (dN, dK)
-    auto dC = make_stride(Int<1>{}, ldC); // (dM, dN)
-
-    // Define CTA tile sizes (static)
-    auto bM = Int<128>{};
-    auto bN = Int<128>{};
-    auto bK = Int<8>{};
-    auto cta_tiler = make_shape(bM, bN, bK); // (BLK_M, BLK_N, BLK_K)
-    auto bP = Int<3>{};                      // Pipeline
-
-    // Define the smem layouts (static)
-    auto sA = make_layout(make_shape(bM, bK, bP)); // (m,k,p) -> smem_idx; m-major
-    auto sB = make_layout(make_shape(bN, bK, bP)); // (n,k,p) -> smem_idx; n-major
-    auto sC = make_layout(make_shape(bM, bN));     // (m,n) -> smem_idx; m-major
-
-    // Define the thread layouts (static)
-
-    TiledCopy copyA = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, TA>{},
-                                      Layout<Shape<_32, _4>>{}, // Thr layout 32x8 m-major
-                                      Layout<Shape<_1, _8>>{}); // Val layout  4x1 m-major
-    TiledCopy copyB = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, TB>{},
-                                      Layout<Shape<_32, _4>>{}, // Thr layout 32x8 n-major
-                                      Layout<Shape<_1, _8>>{}); // Val layout  4x1 n-major
-
-    TiledMMA mmaC = make_tiled_mma(UniversalFMA<TC, TA, TB>{},
-                                   Layout<Shape<_16, _16, _1>>{}); // 16x16x1 TiledMMA
-
-#if 0
-  print(copyA);
-  print(copyB);
-  print(mmaC);
-#endif
-
-#if 0
-  print_latex(copyA);
-  print_latex(copyB);
-  print_latex(mmaC);
-#endif
-
-    /*
-        dim3 dimBlock(size(mmaC));
-        dim3 dimGrid(size(ceil_div(M, bM)),
-                     size(ceil_div(N, bN)));
-        gemm_device<<<dimGrid, dimBlock, 0, stream>>>(prob_shape, cta_tiler,
-                                                      A, dA, sA, copyA,
-                                                      B, dB, sB, copyB,
-                                                      C, dC, sC, mmaC,
-                                                      alpha, beta);
-    */
-}
-
-// Setup params for a NT GEMM
+// Setup params for a TN GEMM
 template <class TA, class TB, class TC,
           class Alpha, class Beta>
 void gemm_tn(int m, int n, int k,
@@ -440,12 +328,6 @@ void gemm_tn(int m, int n, int k,
     auto bP = Int<3>{};                      // Pipeline
 
     // Define the smem layouts (static)
-    /*
-    auto sA_atom = make_layout(make_shape(bM, bK),
-                               make_stride(Int<1>{}, bM + Int<1>{})); // (m,k) -> smem_idx; padded m-major
-    auto sB_atom = make_layout(make_shape(bN, bK),
-                               make_stride(Int<1>{}, bN + Int<1>{})); // (n,k) -> smem_idx; padded n-major
-    */
     auto SmemLayoutAtom = composition(
         Swizzle<3, 3, 3>{},
         make_layout(make_shape(Int<8>{}, Int<32>{}),
@@ -459,26 +341,12 @@ void gemm_tn(int m, int n, int k,
     auto sC = tile_to_shape(
         SmemLayoutAtomC{},
         make_shape(Int<32>{}, Int<32>{}, Int<2>{}));
-    // auto sC = make_layout(make_shape(bM, bN)); // (m,n) -> smem_idx
 
     // Define the thread layouts (static)
 
-    /*
-      TiledCopy copyA = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<TA>, TA>{},
-                                        Layout<Shape<_32,_8>,Stride<_8,_1>>{}, // Thr layout 32x8 k-major
-                                        Layout<Shape< _1,_1>>{});              // Val layout  1x1
-      TiledCopy copyB = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<TB>, TB>{},
-                                        Layout<Shape<_32,_8>,Stride<_8,_1>>{}, // Thr layout 32x8 k-major
-                                        Layout<Shape< _1,_1>>{});              // Val layout  1x1
-
-      TiledMMA mmaC = make_tiled_mma(UniversalFMA<TC,TA,TB>{},
-                                     Layout<Shape<_16,_16,_1>>{});  // 16x16x1 TiledMMA
-
-    */
     TiledMMA mmaC = make_tiled_mma(MMA_Atom<SM80_16x8x16_F16F16F16F16_TN>{},
                                    Layout<Shape<_2, _2, _1>>{},
                                    Tile<_32, _32, _16>{}); // 32x32x16 TiledMMA
-                                                           // Layout<Shape<_1, _2, _1>>{}); // 32x32x16 TiledMMA
 
     auto gmem_copy_atom = Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>, TA>{};
     TiledCopy copyA = make_tiled_copy(gmem_copy_atom,
@@ -492,19 +360,12 @@ void gemm_tn(int m, int n, int k,
                                  make_layout(make_shape(Int<32>{}, Int<4>{}),
                                              make_stride(Int<4>{}, Int<1>{})),
                                  make_layout(make_shape(Int<1>{}, Int<8>{}))));
-    // TiledCopy copyC = copyA;
 
     using Smem_copy_op = SM75_U32x4_LDSM_N;
     using Smem_copy_traits = Copy_Traits<Smem_copy_op>;
     auto smem_copy_atom = Copy_Atom<Smem_copy_traits, TA>{};
 
     auto smem_copy_atom_c = Copy_Atom<UniversalCopy<int>, TC>{};
-
-    /*
-    TiledCopy copyB = make_tiled_copy(Copy_Atom<UniversalCopy<uint128_t>, TB>{},
-                                      Layout<Shape<_32, _4>, Stride<_4, _1>>{}, // Thr layout 16x8 k-major
-                                      Layout<Shape<_1, _8>>{});                 // Val layout  1x8
-    */
 
 #if 0
   print(copyA);
@@ -537,9 +398,7 @@ void gemm(char transA, char transB, int m, int n, int k,
           Beta beta,
           TC *C, int ldC,
           cudaStream_t stream = 0) {
-    if (transA == 'N' && transB == 'T') {
-        return gemm_nt(m, n, k, alpha, A, ldA, B, ldB, beta, C, ldC, stream);
-    } else if (transA == 'T' && transB == 'N') {
+    if (transA == 'T' && transB == 'N') {
         return gemm_tn(m, n, k, alpha, A, ldA, B, ldB, beta, C, ldC, stream);
     }
     assert(false && "Not implemented");
@@ -571,11 +430,11 @@ int main(int argc, char **argv) {
     if (argc >= 4)
         sscanf(argv[3], "%d", &k);
 
-    char transA = 'N';
+    char transA = 'T';
     if (argc >= 5)
         sscanf(argv[4], "%c", &transA);
 
-    char transB = 'T';
+    char transB = 'N';
     if (argc >= 6)
         sscanf(argv[5], "%c", &transB);
 
@@ -638,7 +497,7 @@ int main(int argc, char **argv) {
 
     // Run once
     d_C = h_C;
-    for (int i = 0; i < 1; ++i) {
+    for (int i = 0; i < 5; ++i) {
         gemm(transA, transB, m, n, k,
              alpha,
              d_A.data().get(), ldA,
