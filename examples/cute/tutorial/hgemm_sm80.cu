@@ -13,14 +13,14 @@
 
 #include "cublaslt-gemm.h"
 
-template <class ProblemShape, class CtaTiler,
-          class TA, class AStride, class ASmemLayout, class TiledCopyA, class SmemCopyAtomA,
-          class TB, class BStride, class BSmemLayout, class TiledCopyB, class SmemCopyAtomB,
+template <class ProblemShape, class CtaTiler, class Element,
+          class AStride, class ASmemLayout, class TiledCopyA, class SmemCopyAtomA,
+          class BStride, class BSmemLayout, class TiledCopyB, class SmemCopyAtomB,
           class TC, class CStride, class CSmemLayout, class TiledCopyC, class SmemCopyAtomC,
           class TiledMma, class Alpha, class Beta>
 __global__ static __launch_bounds__(decltype(size(TiledMma{}))::value) void gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
-                                                                                        TA const *A, AStride dA, ASmemLayout sA_layout, TiledCopyA copy_a, SmemCopyAtomA smem_copy_atom_a,
-                                                                                        TB const *B, BStride dB, BSmemLayout sB_layout, TiledCopyB copy_b, SmemCopyAtomB smem_copy_atom_b,
+                                                                                        Element const *A, AStride dA, ASmemLayout sA_layout, TiledCopyA copy_a, SmemCopyAtomA smem_copy_atom_a,
+                                                                                        Element const *B, BStride dB, BSmemLayout sB_layout, TiledCopyB copy_b, SmemCopyAtomB smem_copy_atom_b,
                                                                                         TC *C, CStride dC, CSmemLayout sC_layout, TiledCopyC copy_c, SmemCopyAtomC smem_copy_atom_c, TiledMma mma,
                                                                                         Alpha alpha, Beta beta) {
     using namespace cute;
@@ -58,8 +58,8 @@ __global__ static __launch_bounds__(decltype(size(TiledMma{}))::value) void gemm
     Tensor gC = local_tile(mC, cta_tiler, cta_coord, Step<_1, _1, X>{}); // (BLK_M,BLK_N)
 
     // Shared memory buffers
-    __shared__ TA smemA[cosize_v<ASmemLayout>];
-    __shared__ TB smemB[cosize_v<BSmemLayout>];
+    __shared__ Element smemA[cosize_v<ASmemLayout>];
+    __shared__ Element smemB[cosize_v<BSmemLayout>];
     Tensor sA = make_tensor(make_smem_ptr(smemA), sA_layout); // (BLK_M,BLK_K,PIPE)
     Tensor sB = make_tensor(make_smem_ptr(smemB), sB_layout); // (BLK_N,BLK_K,PIPE)
 
@@ -297,12 +297,12 @@ __global__ static __launch_bounds__(decltype(size(TiledMma{}))::value) void gemm
 }
 
 // Setup params for a TN GEMM
-template <class TA, class TB, class TC,
+template <class Element, class TC,
           class Alpha, class Beta>
 void gemm_tn(int m, int n, int k,
              Alpha alpha,
-             TA const *A, int ldA,
-             TB const *B, int ldB,
+             Element const *A, int ldA,
+             Element const *B, int ldB,
              Beta beta,
              TC *C, int ldC,
              cudaStream_t stream = 0) {
@@ -348,7 +348,7 @@ void gemm_tn(int m, int n, int k,
                                    Layout<Shape<_2, _2, _1>>{},
                                    Tile<_32, _32, _16>{}); // 32x32x16 TiledMMA
 
-    auto gmem_copy_atom = Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>, TA>{};
+    auto gmem_copy_atom = Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>, Element>{};
     TiledCopy copyA = make_tiled_copy(gmem_copy_atom,
                                       Layout<Shape<_32, _4>, Stride<_4, _1>>{}, // Thr layout 16x8 k-major
                                       Layout<Shape<_1, _8>>{});                 // Val layout  1x8
@@ -363,7 +363,7 @@ void gemm_tn(int m, int n, int k,
 
     using Smem_copy_op = SM75_U32x4_LDSM_N;
     using Smem_copy_traits = Copy_Traits<Smem_copy_op>;
-    auto smem_copy_atom = Copy_Atom<Smem_copy_traits, TA>{};
+    auto smem_copy_atom = Copy_Atom<Smem_copy_traits, Element>{};
 
     auto smem_copy_atom_c = Copy_Atom<UniversalCopy<int>, TC>{};
 
@@ -389,12 +389,12 @@ void gemm_tn(int m, int n, int k,
                                                   alpha, beta);
 }
 
-template <class TA, class TB, class TC,
+template <class Element, class TC,
           class Alpha, class Beta>
 void gemm(char transA, char transB, int m, int n, int k,
           Alpha alpha,
-          TA const *A, int ldA,
-          TB const *B, int ldB,
+          Element const *A, int ldA,
+          Element const *B, int ldB,
           Beta beta,
           TC *C, int ldC,
           cudaStream_t stream = 0) {
@@ -438,8 +438,7 @@ int main(int argc, char **argv) {
     if (argc >= 6)
         sscanf(argv[5], "%c", &transB);
 
-    using TA = cute::half_t;
-    using TB = cute::half_t;
+    using Element = cute::half_t;
     using TC = cute::half_t;
     using TI = float;
 
@@ -451,23 +450,23 @@ int main(int argc, char **argv) {
     std::cout << "K = " << k << std::endl;
     std::cout << "C = A^" << transA << " B^" << transB << std::endl;
 
-    thrust::host_vector<TA> h_A(m * k);
-    thrust::host_vector<TB> h_B(n * k);
+    thrust::host_vector<Element> h_A(m * k);
+    thrust::host_vector<Element> h_B(n * k);
     thrust::host_vector<TC> h_C(m * n);
     thrust::host_vector<TC> h_Cblas(m * n);
 
     for (int j = 0; j < m * k; ++j)
-        h_A[j] = static_cast<TA>(2 * (rand() / double(RAND_MAX)) - 1);
+        h_A[j] = static_cast<Element>(2 * (rand() / double(RAND_MAX)) - 1);
     for (int j = 0; j < n * k; ++j)
-        h_B[j] = static_cast<TB>(2 * (rand() / double(RAND_MAX)) - 1);
+        h_B[j] = static_cast<Element>(2 * (rand() / double(RAND_MAX)) - 1);
     for (int j = 0; j < m * n; ++j)
         h_C[j] = static_cast<TC>(-1);
 
     for (int j = 0; j < m * n; ++j)
         h_Cblas[j] = static_cast<TC>(-1);
 
-    thrust::device_vector<TA> d_A = h_A;
-    thrust::device_vector<TB> d_B = h_B;
+    thrust::device_vector<Element> d_A = h_A;
+    thrust::device_vector<Element> d_B = h_B;
     thrust::device_vector<TC> d_Cblas = h_Cblas;
     thrust::device_vector<TC> d_C = h_C;
     CUTE_CHECK_LAST();
@@ -508,7 +507,7 @@ int main(int argc, char **argv) {
     CUTE_CHECK_LAST();
     thrust::host_vector<TC> cute_result = d_C;
 
-    CublasLtGemm<TA, TC> cublaslt_gemm;
+    CublasLtGemm<Element, TC> cublaslt_gemm;
     cublaslt_gemm.init(d_Cblas.data().get(), d_B.data().get(), d_A.data().get(), n, m, k);
     cublaslt_gemm.run();
     thrust::host_vector<TC> cublas_result = d_Cblas;
