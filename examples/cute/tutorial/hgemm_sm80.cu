@@ -15,14 +15,16 @@
 
 using namespace cute;
 
-template <typename KernelTraits, class Alpha, class Beta,
+template <typename KernelTraits,
           class Element = typename KernelTraits::Element,
-          class ElementOutput = typename KernelTraits::ElementOutput>
+          class ElementOutput = typename KernelTraits::ElementOutput,
+          class ElementCompute = typename KernelTraits::ElementCompute>
 __global__ static __launch_bounds__(KernelTraits::kThreadNum) void gemm_device(int m, int n, int k,
                                                                                Element const *A,
                                                                                Element const *B,
                                                                                ElementOutput *C,
-                                                                               Alpha alpha, Beta beta) {
+                                                                               ElementCompute alpha,
+                                                                               ElementCompute beta) {
 
     using CtaTiler = typename KernelTraits::CtaTiler;
     using TiledMMA = typename KernelTraits::TiledMMA;
@@ -315,7 +317,8 @@ __global__ static __launch_bounds__(KernelTraits::kThreadNum) void gemm_device(i
     }
 }
 
-template <typename Element_, int BLK_M_, int BLK_N_, int BLK_K_, int Stages_ = 3, typename ElementOutput_ = Element_>
+template <typename Element_, int BLK_M_, int BLK_N_, int BLK_K_, int Stages_ = 3,
+          typename ElementOutput_ = Element_, typename ElementCompute_ = Element_>
 struct KernelTraits {
 
     static const int BLK_M = BLK_M_;
@@ -324,6 +327,7 @@ struct KernelTraits {
 
     using Element = Element_;
     using ElementOutput = ElementOutput_;
+    using ElementCompute = ElementCompute_;
 
     using CtaTiler = decltype(make_shape(Int<BLK_M>{}, Int<BLK_N>{}, Int<BLK_K>{}));
     using SmemLayoutAtomAB = decltype(composition(
@@ -382,10 +386,10 @@ void gemm_tn(int m, int n, int k,
              ElementOutput *C,
              cudaStream_t stream = 0) {
 
-    using kernel_traits = KernelTraits<Element, 128, 128, 32>;
+    using kernel_traits = KernelTraits<Element, 128, 128, 32, 3, ElementOutput, ElementCompute>;
     auto kShmSize = kernel_traits::kShmSize;
 
-    cudaFuncSetAttribute(gemm_device<kernel_traits, float, float>,
+    cudaFuncSetAttribute(gemm_device<kernel_traits>,
                          cudaFuncAttributeMaxDynamicSharedMemorySize, kShmSize);
 
     dim3 dimBlock(kernel_traits::kThreadNum);
