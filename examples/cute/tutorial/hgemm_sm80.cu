@@ -15,14 +15,14 @@
 
 using namespace cute;
 
-template <typename KernelTraits, class ProblemShape, class Alpha, class Beta,
+template <typename KernelTraits, class Alpha, class Beta,
           class Element = typename KernelTraits::Element,
           class ElementOutput = typename KernelTraits::ElementOutput>
-__global__ static __launch_bounds__(decltype(size(typename KernelTraits::TiledMMA{}))::value) void gemm_device(ProblemShape shape_MNK,
-                                                                                                               Element const *A,
-                                                                                                               Element const *B,
-                                                                                                               ElementOutput *C,
-                                                                                                               Alpha alpha, Beta beta) {
+__global__ static __launch_bounds__(KernelTraits::kThreadNum) void gemm_device(int m, int n, int k,
+                                                                               Element const *A,
+                                                                               Element const *B,
+                                                                               ElementOutput *C,
+                                                                               Alpha alpha, Beta beta) {
 
     using CtaTiler = typename KernelTraits::CtaTiler;
     using TiledMMA = typename KernelTraits::TiledMMA;
@@ -38,6 +38,11 @@ __global__ static __launch_bounds__(decltype(size(typename KernelTraits::TiledMM
     TiledMMA tiled_mma;
 
     // Preconditions
+    auto M = int(m);
+    auto N = int(n);
+    auto K = int(k);
+    auto shape_MNK = make_shape(M, N, K); // (M, N, K)
+
     CUTE_STATIC_ASSERT_V(rank(shape_MNK) == Int<3>{}); // (M, N, K)
     CUTE_STATIC_ASSERT_V(rank(cta_tiler) == Int<3>{}); // (BLK_M, BLK_N, BLK_K)
 
@@ -313,16 +318,20 @@ __global__ static __launch_bounds__(decltype(size(typename KernelTraits::TiledMM
 template <typename Element_, int BLK_M_, int BLK_N_, int BLK_K_, int Stages_ = 3, typename ElementOutput_ = Element_>
 struct KernelTraits {
 
+    static const int BLK_M = BLK_M_;
+    static const int BLK_N = BLK_N_;
+    static const int BLK_K = BLK_K_;
+
     using Element = Element_;
     using ElementOutput = ElementOutput_;
 
-    using CtaTiler = decltype(make_shape(Int<BLK_M_>{}, Int<BLK_N_>{}, Int<BLK_K_>{}));
+    using CtaTiler = decltype(make_shape(Int<BLK_M>{}, Int<BLK_N>{}, Int<BLK_K>{}));
     using SmemLayoutAtomAB = decltype(composition(
         Swizzle<3, 3, 3>{},
         make_layout(make_shape(Int<8>{}, Int<32>{}),
                     make_stride(Int<32>{}, Int<1>{}))));
-    using ASmemLayout = decltype(tile_to_shape(SmemLayoutAtomAB{}, make_shape(Int<BLK_M_>{}, Int<BLK_K_>{}, Int<Stages_>{})));
-    using BSmemLayout = decltype(tile_to_shape(SmemLayoutAtomAB{}, make_shape(Int<BLK_N_>{}, Int<BLK_K_>{}, Int<Stages_>{})));
+    using ASmemLayout = decltype(tile_to_shape(SmemLayoutAtomAB{}, make_shape(Int<BLK_M>{}, Int<BLK_K>{}, Int<Stages_>{})));
+    using BSmemLayout = decltype(tile_to_shape(SmemLayoutAtomAB{}, make_shape(Int<BLK_N>{}, Int<BLK_K>{}, Int<Stages_>{})));
 
     using SmemLayoutAtomC = decltype(composition(
         Swizzle<2, 3, 3>{}, make_layout(make_shape(Int<32>{}, Int<32>{}),
@@ -356,67 +365,34 @@ struct KernelTraits {
     static constexpr int shm_size_AB =
         (cute::cosize_v<ASmemLayout> + cute::cosize_v<BSmemLayout>)*sizeof(Element);
     static constexpr int shm_size_C = cute::cosize_v<CSmemLayout> * sizeof(ElementOutput);
-
-    static constexpr int shm_size =
+    static constexpr int kShmSize =
         cute::max(shm_size_AB, shm_size_C);
+
+    static constexpr int kThreadNum = size_v<TiledMMA>;
 };
 
 // Setup params for a TN GEMM
-template <class Element, class TC,
-          class Alpha, class Beta>
+template <class Element, class ElementOutput,
+          class ElementCompute>
 void gemm_tn(int m, int n, int k,
-             Alpha alpha,
-             Element const *A, int ldA,
-             Element const *B, int ldB,
-             Beta beta,
-             TC *C, int ldC,
+             ElementCompute alpha,
+             Element const *A,
+             Element const *B,
+             ElementCompute beta,
+             ElementOutput *C,
              cudaStream_t stream = 0) {
-    using namespace cute;
 
-    // Define shapes (dynamic)
-    auto M = int(m);
-    auto N = int(n);
-    auto K = int(k);
-    auto prob_shape = make_shape(M, N, K); // (M, N, K)
-
-#if 0
-  print(copyA);
-  print(copyB);
-  print(mmaC);
-#endif
-
-#if 0
-  print_latex(copyA);
-  print_latex(copyB);
-  print_latex(mmaC);
-#endif
     using kernel_traits = KernelTraits<Element, 128, 128, 32>;
+    auto kShmSize = kernel_traits::kShmSize;
 
-    auto shm_size = kernel_traits::shm_size;
+    cudaFuncSetAttribute(gemm_device<kernel_traits, float, float>,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, kShmSize);
 
-    cudaFuncSetAttribute(gemm_device<kernel_traits, decltype(prob_shape), float, float>,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
-
-    dim3 dimBlock(size(typename kernel_traits::TiledMMA{}));
-    dim3 dimGrid(size(ceil_div(M, 128)),
-                 size(ceil_div(N, 128)));
+    dim3 dimBlock(kernel_traits::kThreadNum);
+    dim3 dimGrid(size(ceil_div(m, kernel_traits::BLK_M)),
+                 size(ceil_div(n, kernel_traits::BLK_N)));
     gemm_device<kernel_traits>
-        <<<dimGrid, dimBlock, shm_size, stream>>>(prob_shape, A, B, C, alpha, beta);
-}
-
-template <class Element, class TC,
-          class Alpha, class Beta>
-void gemm(char transA, char transB, int m, int n, int k,
-          Alpha alpha,
-          Element const *A, int ldA,
-          Element const *B, int ldB,
-          Beta beta,
-          TC *C, int ldC,
-          cudaStream_t stream = 0) {
-    if (transA == 'T' && transB == 'N') {
-        return gemm_tn(m, n, k, alpha, A, ldA, B, ldB, beta, C, ldC, stream);
-    }
-    assert(false && "Not implemented");
+        <<<dimGrid, dimBlock, kShmSize, stream>>>(m, n, k, A, B, C, alpha, beta);
 }
 
 int main(int argc, char **argv) {
@@ -445,45 +421,37 @@ int main(int argc, char **argv) {
     if (argc >= 4)
         sscanf(argv[3], "%d", &k);
 
-    char transA = 'T';
-    if (argc >= 5)
-        sscanf(argv[4], "%c", &transA);
-
-    char transB = 'N';
-    if (argc >= 6)
-        sscanf(argv[5], "%c", &transB);
-
     using Element = cute::half_t;
-    using TC = cute::half_t;
-    using TI = float;
+    using ElementOutput = cute::half_t;
+    using ElementCompute = float;
 
-    TI alpha = 1.0;
-    TI beta = 0.0;
+    ElementCompute alpha = 1.0;
+    ElementCompute beta = 0.0;
 
     std::cout << "M = " << m << std::endl;
     std::cout << "N = " << n << std::endl;
     std::cout << "K = " << k << std::endl;
-    std::cout << "C = A^" << transA << " B^" << transB << std::endl;
+    std::cout << "C = A^T" << " B^N" << std::endl;
 
     thrust::host_vector<Element> h_A(m * k);
     thrust::host_vector<Element> h_B(n * k);
-    thrust::host_vector<TC> h_C(m * n);
-    thrust::host_vector<TC> h_Cblas(m * n);
+    thrust::host_vector<ElementOutput> h_C(m * n);
+    thrust::host_vector<ElementOutput> h_Cblas(m * n);
 
     for (int j = 0; j < m * k; ++j)
         h_A[j] = static_cast<Element>(2 * (rand() / double(RAND_MAX)) - 1);
     for (int j = 0; j < n * k; ++j)
         h_B[j] = static_cast<Element>(2 * (rand() / double(RAND_MAX)) - 1);
     for (int j = 0; j < m * n; ++j)
-        h_C[j] = static_cast<TC>(-1);
+        h_C[j] = static_cast<ElementOutput>(-1);
 
     for (int j = 0; j < m * n; ++j)
-        h_Cblas[j] = static_cast<TC>(-1);
+        h_Cblas[j] = static_cast<ElementOutput>(-1);
 
     thrust::device_vector<Element> d_A = h_A;
     thrust::device_vector<Element> d_B = h_B;
-    thrust::device_vector<TC> d_Cblas = h_Cblas;
-    thrust::device_vector<TC> d_C = h_C;
+    thrust::device_vector<ElementOutput> d_Cblas = h_Cblas;
+    thrust::device_vector<ElementOutput> d_C = h_C;
     CUTE_CHECK_LAST();
 
     double gflops = (2.0 * m * n * k) * 1e-9;
@@ -493,48 +461,28 @@ int main(int argc, char **argv) {
 
     int ldA = k, ldB = k, ldC = n;
 
-    /*
-        if (transA == 'N') {
-            ldA = m;
-        } else if (transA == 'T') {
-            ldA = k;
-        } else {
-            assert(false);
-        }
-
-        if (transB == 'N') {
-            ldB = k;
-        } else if (transB == 'T') {
-            ldB = n;
-        } else {
-            assert(false);
-        }
-    */
-
     // Run once
     d_C = h_C;
     for (int i = 0; i < 5; ++i) {
-        gemm(transA, transB, m, n, k,
-             alpha,
-             d_A.data().get(), ldA,
-             d_B.data().get(), ldB,
-             beta,
-             d_C.data().get(), ldC);
+        gemm_tn(m, n, k,
+                alpha,
+                d_A.data().get(),
+                d_B.data().get(),
+                beta,
+                d_C.data().get());
     }
     CUTE_CHECK_LAST();
-    thrust::host_vector<TC> cute_result = d_C;
+    thrust::host_vector<ElementOutput> cute_result = d_C;
 
-    CublasLtGemm<Element, TC> cublaslt_gemm;
+    CublasLtGemm<Element, ElementOutput> cublaslt_gemm;
     cublaslt_gemm.init(d_Cblas.data().get(), d_B.data().get(), d_A.data().get(), n, m, k);
     cublaslt_gemm.run();
-    thrust::host_vector<TC> cublas_result = d_Cblas;
+    thrust::host_vector<ElementOutput> cublas_result = d_Cblas;
     cudaDeviceSynchronize();
 
-    const auto cute_result_ptr = cute_result.data();
-    auto cublas_result_ptr = cublas_result.data();
-    auto tD_host = cute::make_tensor(cute_result_ptr, cute::make_shape(m, n), cute::make_stride(n, 1));
+    auto tD_host = cute::make_tensor(cute_result.data(), cute::make_shape(m, n), cute::make_stride(n, 1));
     auto tD_host_cublaslt =
-        cute::make_tensor(cublas_result_ptr, cute::make_shape(m, n), cute::make_stride(n, 1));
+        cute::make_tensor(cublas_result.data(), cute::make_shape(m, n), cute::make_stride(n, 1));
 
     auto tile = cute::make_tile(min(8, m), min(8, n));
     auto t32x32 = cute::local_tile(tD_host, tile, cute::make_coord(0, 0));
@@ -547,12 +495,12 @@ int main(int argc, char **argv) {
 
         // Timing iterations
         timer.start();
-        gemm(transA, transB, m, n, k,
-             alpha,
-             d_A.data().get(), ldA,
-             d_B.data().get(), ldB,
-             beta,
-             d_C.data().get(), ldC);
+        gemm_tn(m, n, k,
+                alpha,
+                d_A.data().get(),
+                d_B.data().get(),
+                beta,
+                d_C.data().get());
         double cute_time = timer.milliseconds() / float(1);
         CUTE_CHECK_LAST();
         printf("CUTE_GEMM:     [%6.1f]GFlop/s  (%6.4f)ms\n", gflops / cute_time * 1e3, cute_time);
