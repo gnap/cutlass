@@ -344,7 +344,11 @@ struct KernelTraits {
         SmemLayoutAtomC{},
         make_shape(Int<32>{}, Int<32>{}, Int<2>{})));
 
-    using TiledMMA = cute::TiledMMA<MMA_Atom<SM80_16x8x16_F16F16F16F16_TN>,
+    using MMAAtomArch = std::conditional_t<
+        std::is_same_v<ElementCompute, cute::half_t>,
+        MMA_Atom<SM80_16x8x16_F16F16F16F16_TN>,
+        MMA_Atom<SM80_16x8x16_F32F16F16F32_TN>>;
+    using TiledMMA = cute::TiledMMA<MMAAtomArch,
                                     Layout<Shape<_2, _2, _1>>,
                                     Tile<_32, _32, _16>>; // 32x32x16 TiledMMA
 
@@ -427,10 +431,10 @@ int main(int argc, char **argv) {
 
     using Element = cute::half_t;
     using ElementOutput = cute::half_t;
-    using ElementCompute = float;
+    using ElementCompute = cute::half_t;
 
-    ElementCompute alpha = 1.0;
-    ElementCompute beta = 0.0;
+    ElementCompute alpha = ElementCompute(1.0);
+    ElementCompute beta = ElementCompute(0.0);
 
     std::cout << "M = " << m << std::endl;
     std::cout << "N = " << n << std::endl;
@@ -478,7 +482,7 @@ int main(int argc, char **argv) {
     CUTE_CHECK_LAST();
     thrust::host_vector<ElementOutput> cute_result = d_C;
 
-    CublasLtGemm<Element, ElementOutput> cublaslt_gemm;
+    CublasLtGemm<Element, ElementCompute> cublaslt_gemm;
     cublaslt_gemm.init(d_Cblas.data().get(), d_B.data().get(), d_A.data().get(), n, m, k);
     cublaslt_gemm.run();
     thrust::host_vector<ElementOutput> cublas_result = d_Cblas;
